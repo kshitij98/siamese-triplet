@@ -83,7 +83,7 @@ class TripletSelector:
     def __init__(self):
         pass
 
-    def get_triplets(self, embeddings, labels):
+    def get_triplets(self, embeddings, labels, names):
         raise NotImplementedError
 
 
@@ -96,7 +96,7 @@ class AllTripletSelector(TripletSelector):
     def __init__(self):
         super(AllTripletSelector, self).__init__()
 
-    def get_triplets(self, embeddings, labels):
+    def get_triplets(self, embeddings, labels, names):
         labels = labels.cpu().data.numpy()
         triplets = []
         for label in set(labels):
@@ -144,7 +144,51 @@ class FunctionNegativeTripletSelector(TripletSelector):
         self.margin = margin
         self.negative_selection_fn = negative_selection_fn
 
-    def get_triplets(self, embeddings, labels):
+    # Return pairwise distances of between the two given vectors
+    def dist(sample_1, sample_2):
+        n_1, n_2 = sample_1.size(0), sample_2.size(0)
+        norms_1 = torch.sum(sample_1**2, dim=1, keepdim=True)
+        norms_2 = torch.sum(sample_2**2, dim=1, keepdim=True)
+        norms = (norms_1.expand(n_1, n_2) +
+                 norms_2.transpose(0, 1).expand(n_1, n_2))
+        distances_squared = norms - 2 * sample_1.mm(sample_2.t())
+        return torch.abs(distances_squared)
+
+    # Returns the range using distances between the cluster centers
+    def getRange(sample, C):
+        # C is a vector of all the cluster centers
+        d = dist(sample, C)
+        d, indices = d.sort()
+        return d[0, 1], d[0, -1]
+
+    def filter_negatives(positive_idx, negative_indices, names):
+        filenames = []
+        with open('./filenames.txt', 'r') as f:
+            filenames = f.readlines()
+        filenames = [x.strip('\n') for x in filenames]
+        negative_indices = [filenames.index(names[x]) for x in negative_indices]
+        positive_idx = filenames.index(names[positive_idx])
+        C = torch.load('./clusters.pkl')
+        X = torch.load('./features.npy')
+        source = X[positive_idx]
+        X = X[negative_indices]
+
+        d = dist(source, X)
+        d, indices = d.sort()
+
+        l, r = getRange(source, C)
+        t = 0.8
+        threshold = l + (t * (r - l))
+
+        idx = np.searchsorted(d[0, :], threshold)
+        negatives_set = range(search, len(d[0, :]))
+
+        negative_names = [filenames[indices[0, x]] for x in negatives_set]
+        negative_indices = [names.index(x) for x in negative_names]
+
+        return negative_indices
+
+    def get_triplets(self, embeddings, labels, names):
         if self.cpu:
             embeddings = embeddings.cpu()
         distance_matrix = pdist(embeddings)
@@ -165,6 +209,7 @@ class FunctionNegativeTripletSelector(TripletSelector):
             ap_distances = distance_matrix[anchor_positives[:, 0], anchor_positives[:, 1]]
             for anchor_positive, ap_distance in zip(anchor_positives, ap_distances):
                 loss_values = ap_distance - distance_matrix[torch.LongTensor(np.array([anchor_positive[0]])), torch.LongTensor(negative_indices)] + self.margin
+                negative_indices = filter_negatives(anchor_positive[0], negative_indices, names)
                 loss_values = loss_values.data.cpu().numpy()
                 hard_negative = self.negative_selection_fn(loss_values)
                 if hard_negative is not None:
